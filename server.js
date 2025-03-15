@@ -4,69 +4,101 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
-const Message = require("./models/Message");
+const Group = require("./models/Group");
 
 const app = express();
-const server = http.createServer(app);  // ✅ Use HTTP server
-const wss = new WebSocket.Server({ server });  // ✅ Attach WebSocket to server
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 app.use(express.json());
 app.use(cors());
 
-// Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("MongoDB Connected"))
     .catch(err => console.log(err));
 
-app.use("/api/auth", require("./routes/authRoutes"));
+app.use("/api/groups", require("./routes/groupRoutes"));
 
-app.get("/", (req, res) => {
-    res.send("WebSocket server is running.");
-});
-
-app.use((req, res, next) => {
-    res.setHeader("Content-Security-Policy", "connect-src 'self' ws://localhost:5000");
-    next();
-});
-
-app.use("/api/messages", require("./routes/messageRoutes"));
-
-// Store connected users
+// Store connected users & group members
 const users = new Map();
+const groups = new Map();
+const onlineUsers = new Set();
 
-// Handle WebSocket connections
-wss.on("connection", (ws, req) => {
+// Handle WebSocket Connections
+wss.on("connection", (ws) => {
     console.log("New WebSocket client connected");
 
     ws.on("message", async (message) => {
-        const data = JSON.parse(message);
+        try {
+            const data = JSON.parse(message);
 
-        if (data.type === "register") {
-            users.set(data.userId, ws);
-            console.log(`User ${data.userId} registered`);
-        } else if (data.type === "private_message") {
-            const { sender, receiver, content } = data;
-
-            // Store message in MongoDB
-            const newMessage = new Message({ sender, receiver, content });
-            await newMessage.save();
-
-            // Send message to the receiver if online
-            if (users.has(receiver)) {
-                users.get(receiver).send(JSON.stringify({ sender, content }));
+            if (data.type === "register") {
+                users.set(data.userId, ws);
+                ws.userId = data.userId;  // Store user ID on socket
+                onlineUsers.add(data.userId);
+                broadcastOnlineStatus();
             }
+            else if (data.type === "join_group") {
+                const { userId, groupId } = data;
+                if (!groups.has(groupId)) {
+                    groups.set(groupId, new Set());
+                }
+                groups.get(groupId).add(userId);
+                
+                // Notify group members that a new user joined
+                broadcastToGroup(groupId, { type: "user_joined", userId });
+            }
+            else if (data.type === "group_message") {
+                const { sender, groupId, content } = data;
+                const group = await Group.findById(groupId);
+                if (!group) return;
+
+                const newMessage = { sender, content, timestamp: new Date() };
+                group.messages.push(newMessage);
+                await group.save();
+
+                // Send message to group members
+                broadcastToGroup(groupId, { type: "group_message", sender, content });
+            }
+            else if (data.type === "read_receipt") {
+                // Mark messages as read
+                broadcastToGroup(data.groupId, { type: "message_read", userId: data.userId });
+            }
+        } catch (error) {
+            console.error("Error processing message:", error);
         }
     });
 
     ws.on("close", () => {
         console.log("Client disconnected");
-        users.forEach((value, key) => {
-            if (value === ws) {
-                users.delete(key);
-            }
-        });
+        if (ws.userId) {
+            users.delete(ws.userId);
+            onlineUsers.delete(ws.userId);
+            broadcastOnlineStatus();
+        }
     });
 });
 
+// 📌 Broadcast Online Users
+const broadcastOnlineStatus = () => {
+    const onlineUsersArray = Array.from(onlineUsers);
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: "online_users", users: onlineUsersArray }));
+        }
+    });
+};
+
+// 📌 Broadcast to Group Members
+const broadcastToGroup = (groupId, message) => {
+    if (groups.has(groupId)) {
+        groups.get(groupId).forEach(memberId => {
+            if (users.has(memberId)) {
+                users.get(memberId).send(JSON.stringify(message));
+            }
+        });
+    }
+};
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));  // ✅ Corrected
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
