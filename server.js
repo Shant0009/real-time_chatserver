@@ -4,6 +4,7 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
+const Message = require("./models/Message");
 
 const app = express();
 const server = http.createServer(app);  // ✅ Use HTTP server
@@ -28,26 +29,43 @@ app.use((req, res, next) => {
     next();
 });
 
-// Handle WebSocket connections
-wss.on("connection", (ws) => {
-    console.log("New client connected");
+app.use("/api/messages", require("./routes/messageRoutes"));
 
-    ws.on("message", (message) => {
-        console.log(`Received: ${message}`);
-        ws.send(`Server received: ${message}`);
+// Store connected users
+const users = new Map();
+
+// Handle WebSocket connections
+wss.on("connection", (ws, req) => {
+    console.log("New WebSocket client connected");
+
+    ws.on("message", async (message) => {
+        const data = JSON.parse(message);
+
+        if (data.type === "register") {
+            users.set(data.userId, ws);
+            console.log(`User ${data.userId} registered`);
+        } else if (data.type === "private_message") {
+            const { sender, receiver, content } = data;
+
+            // Store message in MongoDB
+            const newMessage = new Message({ sender, receiver, content });
+            await newMessage.save();
+
+            // Send message to the receiver if online
+            if (users.has(receiver)) {
+                users.get(receiver).send(JSON.stringify({ sender, content }));
+            }
+        }
     });
 
     ws.on("close", () => {
         console.log("Client disconnected");
+        users.forEach((value, key) => {
+            if (value === ws) {
+                users.delete(key);
+            }
+        });
     });
-
-    ws.onerror = (error) => {
-        console.error("WebSocket Error:", error);
-    };
-    socket.send("Hello Again!");
-    socket.send("Hello Again!");
-
-    
 });
 
 const PORT = process.env.PORT || 3000;
